@@ -1,0 +1,17 @@
+cnn/
+layers.py       # Layer base class, Conv2D, ReLU, MaxPool2D, Flatten, Dense
+losses.py       # SoftmaxCrossEntropy
+model.py        # Sequential
+optim.py        # SGD, (Momentum, Adam)
+data.py         # loading, preprocessing, batch iterator
+gradcheck.py    # numerical gradient checker
+train.py        # assemble model, run training loop
+
+Build order:
+Data loading + a 1-layer baseline (Flatten -> Dense -> SoftmaxCE) - no convolutions yet
+ReLU and a second Dense layer
+Naive Conv2D - gradient-checked
+MaxPool2D - gradient-checked
+Assemble the CNN and train
+Optimize with im2col
+Extras: momentum/Adam, a second conv block, dropout, batch normalization, saving/loading weights
