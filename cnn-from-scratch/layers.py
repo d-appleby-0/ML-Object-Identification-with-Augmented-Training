@@ -7,8 +7,6 @@ Forward will cache the information necessary for backward pass, where backward p
 respect to layer output and returns gradient with respect to layer input (as well as dW, db)
 """
 
-import time
-
 import numpy as np
 
 class Flatten:                  # Flattens the input tensor into a 2D array (N, D) where D is the product of C, H, and W.
@@ -20,7 +18,7 @@ class Flatten:                  # Flattens the input tensor into a 2D array (N, 
         return dout.reshape(self.in_shape)
 
 class Dense:
-    def __init__(self, d_in, d_out, seed=int(time.time())):
+    def __init__(self, d_in, d_out, seed=None):
         rng = np.random.default_rng(seed)
         self.W = rng.standard_normal((d_in, d_out)) * np.sqrt(2.0 / d_in)   # He (Kaiming) initialization
                                                                             # sets variance of weight for each step to 2 / n_in
@@ -51,22 +49,53 @@ class SoftmaxCE:
         dz[np.arange(N), self.y] -= 1
         return dz / N
 
-def numerical_grad(f, w, eps=1e-5):
-    g = np.zeros_like(w)
-    it = np.nditer(w, flags=['multi_index'])
-    for _ in it:
-        i = it.multi_index
-        old = w[i]
-        w[i] = old + eps; fp = f()
-        w[i] = old - eps; fm = f()
-        w[i] = old
-        g[i] = (fp - fm) / (2 * eps)
-    return g
+class ReLU:
+    def forward(self, x):
+        self.mask = x > 0
+        return x * self.mask
 
-def rel_err(a, b):
-    return np.abs(a - b).max() / (np.abs(a).max() + np.abs(b).max() + 1e-12)
+    def backward(self, dout):
+        return dout * self.mask
 
-if __name__ == "__main__":
+class Conv2D:
+    def __init__(self, c_in, c_out, k, stride=1, pad=0, seed=None):
+        rng = np.random.default_rng(seed)
+        fan_in = c_in * k * k
+        self.W = rng.standard_normal((c_out, c_in, k, k)) * np.sqrt(2.0 / fan_in)  # He init
+        self.b = np.zeros(c_out)
+        self.k, self.stride, self.pad = k, stride, pad
 
-    pass
+    def forward(self, x):
+        N, C, H, W = x.shape
+        F, k, s, p = self.W.shape[0], self.k, self.stride, self.pad
+        xp = np.pad(x, ((0, 0), (0, 0), (p, p), (p, p)))
+        Ho = (H + 2 * p - k) // s + 1
+        Wo = (W + 2 * p - k) // s + 1
+        out = np.zeros((N, F, Ho, Wo))
 
+        for i in range(Ho):
+            for j in range(Wo):
+                patch = xp[:, :, i*s:i*s+k, j*s:j*s+k]               # (N, C, k, k)
+                out[:, :, i, j] = np.tensordot(patch, self.W, axes=([1, 2, 3], [1, 2, 3])) + self.b
+
+        self.xp, self.x_shape = xp, x.shape
+        return out
+
+    def backward(self, dout):
+        N, C, H, W = self.x_shape
+        _, F, Ho, Wo = dout.shape
+        k, s, p = self.k, self.stride, self.pad
+
+        dxp = np.zeros_like(self.xp)
+        self.dW = np.zeros_like(self.W)
+        self.db = dout.sum(axis=(0, 2, 3))
+
+        for i in range(Ho):
+            for j in range(Wo):
+                hs, ws = i * s, j * s
+                patch = self.xp[:, :, hs:hs+k, ws:ws+k]              # (N, C, k, k)
+                d = dout[:, :, i, j]                                 # (N, F)
+                self.dW += np.tensordot(d, patch, axes=([0], [0]))   # (F, C, k, k)
+                dxp[:, :, hs:hs+k, ws:ws+k] += np.tensordot(d, self.W, axes=([1], [0]))  # (N, C, k, k)
+
+        return dxp[:, :, p:p+H, p:p+W]                               # strip the padding
