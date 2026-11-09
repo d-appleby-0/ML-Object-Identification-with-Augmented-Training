@@ -34,21 +34,6 @@ class Dense:
         self.db = dout.sum(axis=0)
         return dout @ self.W.T
 
-class SoftmaxCE:
-    def forward(self, z, y):
-        z = z - z.max(axis=1, keepdims=True)
-        e = np.exp(z)
-        self.p = e / e.sum(axis=1, keepdims=True)                   # p = e^(z_k) / sum_j {e^(z_j)}
-        self.y = y
-        N = z.shape[0]
-        return -np.log(self.p[np.arange(N), y] + 1e-12).mean()      # loss = -mean(log(p[i, y_i]))
-
-    def backward(self):
-        N = self.p.shape[0]
-        dz = self.p.copy()
-        dz[np.arange(N), self.y] -= 1
-        return dz / N
-
 class ReLU:
     def forward(self, x):
         self.mask = x > 0
@@ -57,7 +42,91 @@ class ReLU:
     def backward(self, dout):
         return dout * self.mask
 
+
+
+# ----------------- Replacement Conv2D and MaxPool2D w/ im2col ---------------------------
+
+def im2col(x, k, stride, pad):
+    # (N,C,H,W) -> (N*Ho*Wo, C*k*k) - loops over kernel offsets (k*k iterations) instead of positions
+    N, C, H, W = x.shape
+    Ho = (H + 2 * pad - k) // stride + 1
+    Wo = (W + 2 * pad - k) // stride + 1
+    xp = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
+    cols = np.zeros((N, C, k, k, Ho, Wo))
+    for u in range(k):
+        for v in range(k):
+            cols[:, :, u, v] = xp[:, :, u:u + stride * Ho:stride, v:v + stride * Wo:stride]
+    return cols.transpose(0, 4, 5, 1, 2, 3).reshape(N * Ho * Wo, C * k * k)
+
+def col2im(cols, x_shape, k, stride, pad):
+    # Adjoint of im2col that scatter-adds columns back into an image of shape x_shape
+    N, C, H, W = x_shape
+    Ho = (H + 2 * pad - k) // stride + 1
+    Wo = (W + 2 * pad - k) // stride + 1
+    cols = cols.reshape(N, Ho, Wo, C, k, k).transpose(0, 3, 4, 5, 1, 2)   # (N,C,k,k,Ho,Wo)
+    xp = np.zeros((N, C, H + 2 * pad, W + 2 * pad))
+    for u in range(k):
+        for v in range(k):
+            xp[:, :, u:u + stride * Ho:stride, v:v + stride * Wo:stride] += cols[:, :, u, v]
+    return xp[:, :, pad:pad + H, pad:pad + W]
+
+
 class Conv2D:
+    def __init__(self, c_in, c_out, k, stride=1, pad=0, seed=None):
+        rng = np.random.default_rng(seed)
+        self.W = rng.standard_normal((c_out, c_in, k, k)) * np.sqrt(2.0 / (c_in * k * k))
+        self.b = np.zeros(c_out)
+        self.k, self.stride, self.pad = k, stride, pad
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        F, k, s, p = self.W.shape[0], self.k, self.stride, self.pad
+        Ho = (H + 2 * p - k) // s + 1
+        Wo = (W + 2 * p - k) // s + 1
+        self.cols = im2col(x, k, s, p)                          # (N*Ho*Wo, C*k*k)
+        out = self.cols @ self.W.reshape(F, -1).T + self.b      # (N*Ho*Wo, F)
+        self.x_shape = x.shape
+        return out.reshape(N, Ho, Wo, F).transpose(0, 3, 1, 2)
+
+    def backward(self, dout):
+        F = self.W.shape[0]
+        dmat = dout.transpose(0, 2, 3, 1).reshape(-1, F)        # (N*Ho*Wo, F)
+        self.db = dmat.sum(axis=0)
+        self.dW = (dmat.T @ self.cols).reshape(self.W.shape)
+        dcols = dmat @ self.W.reshape(F, -1)
+        return col2im(dcols, self.x_shape, self.k, self.stride, self.pad)
+
+
+class MaxPool2D:
+    def __init__(self, k=2, stride=None):
+        self.k = k
+        self.stride = stride if stride is not None else k
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        k, s = self.k, self.stride
+        Ho, Wo = (H - k) // s + 1, (W - k) // s + 1
+        # pool each channel independently: treat every (n, c) as its own 1-channel image
+        cols = im2col(x.reshape(N * C, 1, H, W), k, s, 0)       # (N*C*Ho*Wo, k*k)
+        self.argmax = cols.argmax(axis=1)
+        self.x_shape = x.shape
+        out = cols[np.arange(cols.shape[0]), self.argmax]
+        return out.reshape(N, C, Ho, Wo)
+
+    def backward(self, dout):
+        N, C, H, W = self.x_shape
+        dcols = np.zeros((dout.size, self.k * self.k))
+        dcols[np.arange(dout.size), self.argmax] = dout.ravel()
+        dx = col2im(dcols, (N * C, 1, H, W), self.k, self.stride, 0)
+        return dx.reshape(self.x_shape)
+
+
+
+
+
+# Alpha implementation of Conv2D and MaxPool2D used as reference for replacement with im2col protocol
+
+class Conv2DNaive:
     def __init__(self, c_in, c_out, k, stride=1, pad=0, seed=None):
         rng = np.random.default_rng(seed)
         fan_in = c_in * k * k
@@ -93,9 +162,48 @@ class Conv2D:
         for i in range(Ho):
             for j in range(Wo):
                 hs, ws = i * s, j * s
-                patch = self.xp[:, :, hs:hs+k, ws:ws+k]              # (N, C, k, k)
-                d = dout[:, :, i, j]                                 # (N, F)
-                self.dW += np.tensordot(d, patch, axes=([0], [0]))   # (F, C, k, k)
-                dxp[:, :, hs:hs+k, ws:ws+k] += np.tensordot(d, self.W, axes=([1], [0]))  # (N, C, k, k)
+                patch = self.xp[:, :, hs:hs+k, ws:ws+k]                                     # (N, C, k, k)
+                d = dout[:, :, i, j]                                                        # (N, F)
+                self.dW += np.tensordot(d, patch, axes=([0], [0]))                          # (F, C, k, k)
+                dxp[:, :, hs:hs+k, ws:ws+k] += np.tensordot(d, self.W, axes=([1], [0]))     # (N, C, k, k)
 
-        return dxp[:, :, p:p+H, p:p+W]                               # strip the padding
+        return dxp[:, :, p:p+H, p:p+W]                  # remove padding to return gradient 
+
+class MaxPool2DNaive:
+    def __init__(self, k=2, stride=None):
+        self.k = k
+        self.stride = stride if stride != None else k
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        k, s = self.k, self.stride
+        Ho = (H - k) // s + 1
+        Wo = (W - k) // s + 1
+        out = np.zeros((N, C, Ho, Wo))
+        self.argmax = np.zeros((N, C, Ho, Wo), dtype=int)   # flat index within each window
+
+        for i in range(Ho):
+            for j in range(Wo):
+                win = x[:, :, i*s:i*s+k, j*s:j*s+k]          # (N, C, k, k)
+                flat = win.reshape(N, C, k * k)
+                self.argmax[:, :, i, j] = flat.argmax(axis=2)
+                out[:, :, i, j] = flat.max(axis=2)
+
+        self.x_shape = x.shape
+        return out
+
+    def backward(self, dout):
+        N, C, H, W = self.x_shape
+        _, _, Ho, Wo = dout.shape
+        k, s = self.k, self.stride
+        dx = np.zeros(self.x_shape)
+
+        n_idx, c_idx = np.meshgrid(np.arange(N), np.arange(C), indexing="ij")   # (N, C) each
+
+        for i in range(Ho):
+            for j in range(Wo):
+                a = self.argmax[:, :, i, j]                  # (N, C)
+                u, v = a // k, a % k                         # row/col offset inside the window
+                dx[n_idx, c_idx, i*s + u, j*s + v] += dout[:, :, i, j]
+
+        return dx
