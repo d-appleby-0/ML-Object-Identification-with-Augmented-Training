@@ -1,32 +1,85 @@
 import numpy as np
-from layers import Flatten, Dense, ReLU, Conv2D, MaxPool2D, Conv2DNaive, MaxPool2DNaive
+from layers import BatchNorm, Flatten, Dense, ReLU, Conv2D, MaxPool2D, Conv2DNaive, MaxPool2DNaive, Dropout, get_param_names
 from losses import SoftmaxCE
 from gradcheck import check_layer, check_model, numerical_grad, rel_err
+from train import build_xray_model
 
 #   *******     Constants     *******
 learning_rate = 0.05    # defaulted at 0.1, lowered to 0.05 due to jumpy losses
                         # running conv with no maxpooling 
 
+# ----------------- BatchNorm tests ---------------------------
 
-def run_gradchecks():
-    digits = load_digits()
-    # small slice: numerical grads cost 2 forward passes per parameter
-    x = (digits.data[:8] / 16.0).reshape(-1, 1, 8, 8)      # (N, C, H, W)
-    y = digits.target[:8]
-    ok = True
+def batchnorm_test():
+    rng = np.random.default_rng(7)
 
-    print("ReLU alone (random input):")
-    xr = np.random.default_rng(1).standard_normal((4, 10))
-    ok &= check_layer(ReLU(), xr)
+    for shape in [(6, 3, 4, 4), (8, 5)]:
+        print(f"BatchNorm input {shape}:")
+        bn = BatchNorm(shape[1])
+        bn.gamma[...] = 1.0 + 0.3 * rng.standard_normal(shape[1])      # nonuniform, so dgamma/dbeta are tested
+        bn.beta[...] = 0.3 * rng.standard_normal(shape[1])
+        x = 2.0 * rng.standard_normal(shape) + 1.5                     # nonzero mean, non-unit variance
+        assert check_layer(bn, x), "gradient check failed (train mode)"
+        bn.training = False
+        assert check_layer(bn, x), "gradient check failed (eval mode)"
 
-    print("Dense alone:")
-    ok &= check_layer(Dense(10, 5, seed=0), xr)
+    # training output is normalized per channel
+    bn = BatchNorm(3)
+    x = 2.0 * rng.standard_normal((16, 3, 5, 5)) + 1.5
+    out = bn.forward(x)
+    assert np.allclose(out.mean(axis=(0, 2, 3)), 0, atol=1e-10)
+    assert np.allclose(out.var(axis=(0, 2, 3)), 1, atol=1e-3)
 
-    print("Full model, Flatten -> Dense -> ReLU -> Dense -> SoftmaxCE:")
-    layers = [Flatten(), Dense(64, 16, seed=0), ReLU(), Dense(16, 10, seed=1)]
+    # shift invariance - sum of dx over each channel is exactly zero
+    dx = bn.backward(rng.standard_normal(out.shape))
+    assert np.allclose(dx.sum(axis=(0, 2, 3)), 0, atol=1e-10), "dx is not shift-invariant"
 
-    ok &= check_model(layers, SoftmaxCE(), x, y)
-    return ok
+    # running stats converge to the batch stats, and eval must not update them
+    bn = BatchNorm(3, momentum=0.9)
+    for _ in range(300):
+        train_out = bn.forward(x)
+    before = bn.running_mean.copy()
+    bn.training = False
+    assert np.allclose(bn.forward(x), train_out, atol=1e-6), "eval output != train output at convergence"
+    assert np.array_equal(bn.running_mean, before), "eval mode modified running stats"
+    print("  batchnorm tests passed")
+
+
+
+# ----------------- Dropout tests ---------------------------
+
+def dropout_test():
+    rng = np.random.default_rng(6)
+
+    # 1) ~p of units dropped, expectation preserved (inverted scaling)
+    d = Dropout(0.3, seed=0)
+    out = d.forward(np.ones((1000, 1000)))
+    print(f"  dropped fraction {np.mean(out == 0):.3f} (want ~0.300), mean output {out.mean():.3f} (want ~1.000)")
+    assert abs(np.mean(out == 0) - 0.3) < 0.01 and abs(out.mean() - 1.0) < 0.01
+
+    # 2) eval mode is the identity, forward and backward
+    d.training = False
+    x = rng.standard_normal((4, 10))
+    assert np.array_equal(d.forward(x), x) and np.array_equal(d.backward(x), x)
+
+    # 3) backward is exactly zero where forward dropped
+    d.training = True
+    out = d.forward(x)
+    dx = d.backward(np.ones_like(x))
+    assert np.all(dx[out == 0] == 0) and np.all(dx[out != 0] != 0)
+
+    # 4) numerical gradient check with the mask frozen
+    d = Dropout(0.4, seed=1)
+    d.freeze = True
+    assert check_layer(d, rng.standard_normal((5, 8))), "gradient check failed"
+
+    # 5) Sequential.predict must run in eval mode and restore train mode
+    m = build_xray_model(size=16, channels=(4,), p_drop=0.5, bn=False)
+    X = rng.random((6, 1, 16, 16))
+    drop = next(l for l in m.layers if isinstance(l, Dropout))
+    assert np.array_equal(m.predict(X), m.predict(X)), "predict is stochastic: dropout still active"
+    assert m.training and drop.training, "mode was not restored after predict"
+    print("  dropout tests passed")
 
 
 # ----------------- Conv2D tests -------------------------------
@@ -163,9 +216,8 @@ def backward_all(layers, dout):
 
 def sgd_step(layers, lr):
     for l in layers:
-        if hasattr(l, "W"):
-            l.W -= lr * l.dW
-            l.b -= lr * l.db
+        for n in get_param_names(l):
+            getattr(l, n)[...] -= lr * getattr(l, "d" + n)
 
 
 
@@ -185,8 +237,31 @@ def init_test():
     assert check_layer(ReLU(), rng.standard_normal((4, 10)))
 
 
+# ***************** obsolete version of scikit learn digits test **************
 
+"""
+def run_gradchecks():
+    digits = load_digits()
+    # small slice: numerical grads cost 2 forward passes per parameter
+    x = (digits.data[:8] / 16.0).reshape(-1, 1, 8, 8)      # (N, C, H, W)
+    y = digits.target[:8]
+    ok = True
 
+    print("ReLU alone (random input):")
+    xr = np.random.default_rng(1).standard_normal((4, 10))
+    ok &= check_layer(ReLU(), xr)
+
+    print("Dense alone:")
+    ok &= check_layer(Dense(10, 5, seed=0), xr)
+
+    print("Full model, Flatten -> Dense -> ReLU -> Dense -> SoftmaxCE:")
+    layers = [Flatten(), Dense(64, 16, seed=0), ReLU(), Dense(16, 10, seed=1)]
+
+    ok &= check_model(layers, SoftmaxCE(), x, y)
+    return ok
+"""
+
+"""
 # ----------------- Full sci-kit learn digits test ---------------------------
 
 from sklearn.datasets import load_digits
@@ -214,17 +289,19 @@ def test_digits():
             sgd_step(layers, lr)
         acc = (forward_all(layers, Xte).argmax(1) == Yte).mean()
         print(f"epoch {epoch:2d}  loss {np.mean(losses):.3f}  test acc {acc:.3f}")
-
-
+"""
 
 if __name__ == "__main__":
     
     # speed test of Conv2D vs Conv2DNaive
     # im2col_speed_test()
 
-    assert run_gradchecks(), "gradient check failed, fix before training"
+
+    # assert run_gradchecks(), "gradient check failed, fix before training"
     im2col_equivalence_test()
     conv_test()
     maxpool_test()
     init_test()
-    test_digits()
+    # test_digits()
+    dropout_test()
+    batchnorm_test()

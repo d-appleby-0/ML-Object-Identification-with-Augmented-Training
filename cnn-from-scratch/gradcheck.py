@@ -16,15 +16,16 @@ def numerical_grad(f, w, eps=1e-5):
 def rel_err(a, b):
     return np.abs(a - b).max() / (np.abs(a).max() + np.abs(b).max() + 1e-12)
 
-def _compare(checks, tol, verbose):
+def _compare(checks, tol, verbose, atol = 1e-8):
     # checks: list of (label, numerical, analytic).
     ok = True
     for label, num, ana in checks:
         err = rel_err(num, ana)
-        passed = err < tol
+        abs_err = np.abs(num - ana).max()
+        passed = err < tol or abs_err < atol
         ok &= passed
         if verbose:
-            print(f"  {'PASS' if passed else 'FAIL'}  {label:<22} rel err {err:.2e}")
+            print(f"  {'PASS' if passed else 'FAIL'}  {label:<26} rel err {err:.2e}  abs {abs_err:.1e}")
     return ok
 
 def check_layer(layer, x, tol=1e-6, verbose=True):

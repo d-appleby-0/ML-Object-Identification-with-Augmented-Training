@@ -123,6 +123,27 @@ class MaxPool2D:
 
 
 
+class Dropout:
+    def __init__(self, p=0.5, seed=None):
+        assert 0.0 <= p < 1.0
+        self.p = p
+        self.rng = np.random.default_rng(seed)
+        self.training = True
+        self.freeze = False            # test hook - reuse the previous mask so numerical gradients are deterministic
+        self.mask = None
+
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            self.mask = None
+            return x
+        if not (self.freeze and self.mask is not None and self.mask.shape == x.shape):
+            self.mask = (self.rng.random(x.shape) >= self.p) / (1.0 - self.p)
+        return x * self.mask
+
+    def backward(self, dout):
+        return dout if self.mask is None else dout * self.mask
+
+
 
 # Alpha implementation of Conv2D and MaxPool2D used as reference for replacement with im2col protocol
 
@@ -207,3 +228,58 @@ class MaxPool2DNaive:
                 dx[n_idx, c_idx, i*s + u, j*s + v] += dout[:, :, i, j]
 
         return dx
+
+
+# ------------------- Batch Normalization methods and helper ------------------------------
+
+def get_param_names(layer):
+    if hasattr(layer, "param_names"):
+        return layer.param_names
+    return ("W", "b") if hasattr(layer, "W") else ()
+
+
+class BatchNorm:
+    # Per-channel batch norm. Input (N,C,H,W) reduces over (N,H,W), input (N,C) reduces over N.
+    param_names = ("gamma", "beta")
+    buffer_names = ("running_mean", "running_var")
+
+    def __init__(self, channels, momentum=0.9, eps=1e-5):
+        self.gamma = np.ones(channels)
+        self.beta = np.zeros(channels)
+        self.running_mean = np.zeros(channels)
+        self.running_var = np.ones(channels)
+        self.momentum, self.eps = momentum, eps
+        self.training = True
+
+    def forward(self, x):
+        if x.ndim == 4:
+            axes, shp = (0, 2, 3), (1, -1, 1, 1)
+        elif x.ndim == 2:
+            axes, shp = (0,), (1, -1)
+        else:
+            raise ValueError(f"BatchNorm expects 2D or 4D input, got {x.ndim}D")
+
+        if self.training:
+            mu, var = x.mean(axis=axes), x.var(axis=axes)           # biased - divides by m
+            self.running_mean[...] = self.momentum * self.running_mean + (1 - self.momentum) * mu
+            self.running_var[...] = self.momentum * self.running_var + (1 - self.momentum) * var
+        else:
+            mu, var = self.running_mean, self.running_var
+
+        self.istd = 1.0 / np.sqrt(var + self.eps)
+        self.xhat = (x - mu.reshape(shp)) * self.istd.reshape(shp)
+        self.axes, self.shp = axes, shp
+        return self.gamma.reshape(shp) * self.xhat + self.beta.reshape(shp)
+
+    def backward(self, dout):
+        axes, shp = self.axes, self.shp
+        self.dgamma = (dout * self.xhat).sum(axis=axes)
+        self.dbeta = dout.sum(axis=axes)
+        dxhat = dout * self.gamma.reshape(shp)
+        if not self.training:                                       # fixed affine map in eval mode
+            return dxhat * self.istd.reshape(shp)
+        m = dout.size // self.gamma.size                            # elements per channel
+        return (self.istd.reshape(shp) / m) * (
+            m * dxhat
+            - dxhat.sum(axis=axes, keepdims=True)
+            - self.xhat * (dxhat * self.xhat).sum(axis=axes, keepdims=True))
