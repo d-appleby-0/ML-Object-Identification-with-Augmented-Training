@@ -183,6 +183,7 @@ def main(epochs=def_epochs, lr=def_learning_rate, bs=32, seed=0, size=128, chann
         with open(log_file, "w") as f:
             f.write("Epoch | Train Loss | Val AUC | Val Sens | Val Spec | Val F1 | Time (s)\n")
             f.write("-" * 65 + "\n")
+            print("Epoch | Train Loss | Val AUC | Val Sens | Val Spec | Val F1 | Time (s)")
 
     for epoch in range(start, epochs):
         opt.lr = lr * 0.5 * (1 + np.cos(np.pi * epoch / epochs))     # cosine decay to ~0
@@ -247,7 +248,7 @@ if __name__ == "__main__":
 
 
     ckpt_directory = "C:/ckpts/xray_5_epoch_test_w_plots"
-    test_report, history = main(epochs=30, ckpt_dir=ckpt_directory)
+    test_report, history = main(epochs=5, ckpt_dir=ckpt_directory)
     
     # Plot results
     plot_training_metrics(history, save_path=f"{ckpt_directory}/learning_curves.png")

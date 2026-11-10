@@ -42,7 +42,7 @@ def check_layer(layer, x, tol=1e-6, verbose=True):
                            getattr(layer, "d" + name)))
     return _compare(checks, tol, verbose)
 
-def check_model(layers, loss, x, y, tol=1e-6, verbose=True):
+def check_model(layers, loss, x, y, tol=1e-6, verbose=True, eps=1e-5):
     # check a full stack of layers against the total loss
     def f():
         out = x
@@ -55,11 +55,11 @@ def check_model(layers, loss, x, y, tol=1e-6, verbose=True):
     for l in reversed(layers):
         g = l.backward(g)
 
-    checks = [("input x", numerical_grad(f, x), g)]
+    checks = [("input x", numerical_grad(f, x, eps), g)]
     for i, l in enumerate(layers):
         for name in ("W", "b"):
             if hasattr(l, name):
                 checks.append((f"layer {i} {type(l).__name__}.{name}",
-                               numerical_grad(f, getattr(l, name)),
+                               numerical_grad(f, getattr(l, name), eps),
                                getattr(l, "d" + name)))
     return _compare(checks, tol, verbose)

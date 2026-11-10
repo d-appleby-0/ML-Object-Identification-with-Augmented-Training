@@ -32,6 +32,38 @@ def xray_batches(X, boxes, batch_size, rng=None, augment=None, train=True):
             ys.append(int(len(b) > 0))               # image-level label from surviving boxes
         yield np.stack(xs), np.array(ys)
 
+# data.py
+def xray_det_batches(X, boxes, batch_size, rng=None, augment=None, train=True):
+    # Like xray_batches, but yields the (augmented) box arrays instead of image-level labels
+    order = rng.permutation(len(X)) if train else np.arange(len(X))
+    for i in range(0, len(order), batch_size):
+        xs, bs = [], []
+        for j in order[i:i + batch_size]:
+            img, b = X[j].astype(np.float64) / 255.0, boxes[j]
+            if augment is not None:
+                img, b = augment(img, b, rng)
+            xs.append(img[None]); bs.append(b)
+        yield np.stack(xs), bs
+
+def synthetic_det_data(n=200, size=64, seed=0):
+    # Noise images with 0-2 bright squares of random size, plus boxes, for tests and smoke runs only
+    rng = np.random.default_rng(seed)
+    X = rng.integers(0, 100, (n, size, size)).astype(np.uint8)
+    boxes = []
+    for i in range(n):
+        rows = []
+        for _ in range(rng.integers(0, 3)):
+            s = int(rng.integers(size // 8, size // 3))
+            x0, y0 = (int(v) for v in rng.integers(1, size - s - 1, 2))
+            cx, cy = x0 + s / 2, y0 + s / 2
+            if any(abs(cx - r[1] * size) < (s + r[3] * size) / 2 and
+                   abs(cy - r[2] * size) < (s + r[4] * size) / 2 for r in rows):
+                continue                                            # skip overlapping squares
+            X[i, y0:y0 + s, x0:x0 + s] = int(rng.integers(180, 256))
+            rows.append([0, cx / size, cy / size, s / size, s / size])
+        boxes.append(np.array(rows).reshape(-1, 5))
+    return X, boxes
+
 
 def read_yolo_label(path):
     # (K, 5) rows [cls, xc, yc, w, h], polygon lines (YOLO segmentation) become their bounding box

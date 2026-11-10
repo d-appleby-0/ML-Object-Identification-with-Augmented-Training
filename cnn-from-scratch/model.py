@@ -50,6 +50,14 @@ class Sequential:
         e = np.exp(z)
         return e / e.sum(axis=1, keepdims=True)
 
+    def infer(self, x):
+        was = self.training
+        self.eval()
+        try:
+            return self.forward(x)
+        finally:
+            self.train(was)
+
     def summary(self, input_shape, verbose=True):
         was = self.training
         self.eval()
